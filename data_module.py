@@ -1,105 +1,126 @@
-#This basically is a module that takes the images, prepares them and sends them to the neural network
-#currently it is using placeholder images, and once I get a dataset, I will update the code accordingly.
-#I will also have it implemented to the base_cnn.py at a later date.
+#This should be implmented with base_cnn 
+#It should read the pothole images now instead of generating images since this was a placeholder
+#It was supposed to make sure the program ran so now here it is.
 
-import torch
 import lightning.pytorch as pl
+from pathlib import Path
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 
-from torch.utils.data import DataLoader, TensorDataset
+#Loading Dataset Class
+class PotholeImageDataset(Dataset):
+    def __init__(self, folder):
+        self.folder = Path(folder)
+        #Check to see if the folder is there before proceeding
+        if not self.folder.is_dir():
+            raise FileNotFoundError(f"Dataset folder not found: {self.folder.resolve()}")
 
+        extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
+        self.images = sorted(path for path in self.folder.rglob("*")
+            if path.is_file() and path.suffix.lower() in extensions)
+        
+        if not self.images:
+            raise ValueError(f"No images found in {self.folder}")
+        #Formats the images to make it readable to the system
+        self.transform = transforms.Compose([transforms.Resize((64, 64)), transforms.ToTensor()])
 
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        image_path = self.images[index]
+
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            image = self.transform(image)
+        
+        label_map = {"none": 0, "low": 1, "medium": 2, "high": 3}
+        label = label_map[image_path.parent.name.lower()]
+
+        return (image, label)
+
+#Prepares the Datasets and DataLoaders for the model
 class PotholeDataModule(pl.LightningDataModule):
 
-    def __init__(self,
-                 batch_size=16,
-                 num_workers=0,
-                 location="./datasets"):
-
+    def __init__(self, batch_size=16, num_workers=0, location="./datasets"):
         super().__init__()
 
-        # Settings
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.location = location
+        self.location = Path(location)
 
-        # Temporary image and label dimensions
         self.input_shape = (3, 64, 64)
-        self.output_shape = (3,)
+        self.output_shape = (4,)
 
-        # Dataset placeholders
         self.data_train = None
         self.data_val = None
         self.data_test = None
 
-        
     def setup(self, stage=None):
-
+        #Sets up the testing data
         if stage in (None, "fit", "validate"):
+            if self.data_train is None:
+                self.data_train = PotholeImageDataset(self.location / "train")
 
-            # Create 80 fake training images
-            x_train = torch.rand(80, 3, 64, 64)
+            if self.data_val is None:
+                val_folder = self.location / "val"
 
-            # Create 80 random severity labels
-            y_train = torch.randint(0, 3, (80,))
+                if not val_folder.is_dir():
+                    val_folder = self.location / "valid"
 
-            # Create 20 fake validation images
-            x_val = torch.rand(20, 3, 64, 64)
-
-            # Create 20 random validation labels
-            y_val = torch.randint(0, 3, (20,))
-
-            self.data_train = TensorDataset(
-                x_train, y_train
-            )
-
-            self.data_val = TensorDataset(
-                x_val, y_val
-            )
-
+                self.data_val = PotholeImageDataset(val_folder)
+            #Load it when done or predicting
         if stage in (None, "test", "predict"):
+            if self.data_test is None:
+                self.data_test = PotholeImageDataset(self.location / "test")
 
-            # Create 20 fake testing images
-            x_test = torch.rand(20, 3, 64, 64)
-
-            # Create 20 random testing labels
-            y_test = torch.randint(0, 3, (20,))
-
-            self.data_test = TensorDataset(
-                x_test, y_test
-            )
-
-
-    
     def train_dataloader(self):
         return DataLoader(
             self.data_train,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            shuffle=True
-        )
+            shuffle=True)
 
     def val_dataloader(self):
         return DataLoader(
             self.data_val,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            shuffle=False
-        )
+            shuffle=False)
 
     def test_dataloader(self):
         return DataLoader(
             self.data_test,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            shuffle=False
-        )
+            shuffle=False)
 
     def predict_dataloader(self):
         return DataLoader(
             self.data_test,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
-            shuffle=False
-        )
+            shuffle=False)
+
+#This is for debugging purposes to make sure everything works
+if __name__ == "__main__":
+
+    data_module = PotholeDataModule()
+
+    data_module.setup("fit")
+    data_module.setup("test")
+
+    for name, loader in [
+        ("Training", data_module.train_dataloader()),
+        ("Validation", data_module.val_dataloader()),
+        ("Testing", data_module.test_dataloader())
+    ]:
+        batch = next(iter(loader))
+        print(f"{name}: {len(loader.dataset)} images")
+        print("Batch shape:", batch[0].shape)
+
+    print("Real image loading successful!")
+
 
