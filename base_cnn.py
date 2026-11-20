@@ -1,4 +1,4 @@
-# THIS PROGRAM WILL BE A BASE COMPARISON TO THE REINFORCED CNN
+# THIS PROGRAM IS A BASE COMPARISON TO THE REINFORCED CNN
 # This boilerplate was taken from Dr. Joshua L. Phillips course material.
 
 # imports
@@ -12,6 +12,10 @@ from torchview import draw_graph
 import matplotlib.pyplot as plt
 import pandas as pd
 import os
+from pathlib import Path
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 
 my_job_id = os.environ["SLURM_JOBID"]
 
@@ -22,79 +26,116 @@ if torch.cuda.is_available():
     print("GPU Count:",torch.cuda.device_count())
     print("GPU Properties:",torch.cuda.get_device_properties())
 
-# Data Module - THIS WILL CHANGE
-class CIFAR10DataModule(pl.LightningDataModule):
-    def __init__(self,
-                 batch_size = 128,
-                 val_split = 0.2,
-                 num_workers = 4,
-                 location = "./datasets",
-                 **kwargs):
-        super().__init__(**kwargs)
+# Function that provides labeling when labels are needed in reward function
+def labeling(paths):
+    label_map = {"none": 0, "low": 1, "medium": 2, "high": 3}
+    labels = []
+    for p in paths:
+        name = Path(p).parent.name.lower()
+        if name not in label_map:
+            raise ValueError(f"Unexpected label folder '{name}' for {p}")
+        labels.append(label_map[name])
+    return torch.tensor(labels)
+
+
+#Loading Dataset Class
+class PotholeImageDataset(Dataset):
+    def __init__(self, folder):
+        self.folder = Path(folder)
+        #Check to see if the folder is there before proceeding
+        if not self.folder.is_dir():
+            raise FileNotFoundError(f"Dataset folder not found: {self.folder.resolve()}")
+
+        extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+        self.images = sorted(path for path in self.folder.rglob("*")
+            if path.is_file() and path.suffix.lower() in extensions)
+        
+        if not self.images:
+            raise ValueError(f"No images found in {self.folder}")
+        
+        self.labels = labeling(self.images)
+
+        #Formats the images to make it readable to the system
+        self.transform = transforms.Compose([transforms.Resize((64, 64)), transforms.ToTensor()])
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        image_path = self.images[index]
+
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            image = self.transform(image)
+        return (image, self.labels[index])
+
+#Prepares the Datasets and DataLoaders for the model
+class PotholeDataModule(pl.LightningDataModule):
+
+    def __init__(self, batch_size=16, num_workers=0, location="./datasets"):
+        super().__init__()
+
         self.batch_size = batch_size
-        self.val_split = val_split
         self.num_workers = num_workers
-        self.location = location
-        self.input_shape = None
-        self.output_shape = None
+        self.location = Path(location)
+
+        self.input_shape = (3, 64, 64)
+        self.output_shape = (4,)
+
         self.data_train = None
         self.data_val = None
         self.data_test = None
 
-    def setup(self, stage: str):
-        if (stage == 'fit' or \
-            stage == 'validate') and \
-            not(self.data_train and self.data_val):
-            training_dataset = torchvision.datasets.CIFAR10(root=self.location,download=True, train=True)
-            x_train = training_dataset.data.transpose((0,3,1,2))
-            x_train = (x_train / 127.5) - 1.0
-            y_train = np.array(training_dataset.targets)
-            self.input_shape = x_train.shape[1:]
-            self.output_shape = (len(np.unique(y_train)),)
-            rng = np.random.default_rng()
-            permutation = rng.permutation(x_train.shape[0])
-            split_point = int(x_train.shape[0]*(1.0-self.val_split))
-            self.data_train = list(zip(torch.Tensor(x_train[permutation[:split_point]]).to(torch.float32),
-                                       torch.Tensor(y_train[permutation[:split_point]]).to(torch.long)))
-            self.data_val = list(zip(torch.Tensor(x_train[permutation[split_point:]]).to(torch.float32),
-                                     torch.Tensor(y_train[permutation[split_point:]]).to(torch.long)))
-        if (stage == 'test' or \
-            stage == 'predict') and \
-            not self.data_test:
-            testing_dataset = torchvision.datasets.CIFAR10(root=self.location,download=True, train=False)
-            x_test = testing_dataset.data.transpose((0,3,1,2))
-            x_test = (x_test / 127.5) - 1.0
-            y_test = np.array(testing_dataset.targets)
-            self.input_shape = x_test.shape[1:]
-            self.output_shape = (len(np.unique(y_test)),)
-            self.data_test = list(zip(torch.Tensor(x_test).to(torch.float32),
-                                      torch.Tensor(y_test).to(torch.long)))
-            
+    def setup(self, stage=None):
+        #Sets up the testing data
+        if stage in (None, "fit", "validate"):
+            if self.data_train is None:
+                self.data_train = PotholeImageDataset(self.location / "train")
+
+            if self.data_val is None:
+                val_folder = self.location / "val"
+
+                if not val_folder.is_dir():
+                    val_folder = self.location / "valid"
+
+                self.data_val = PotholeImageDataset(val_folder)
+            #Load it when done or predicting
+        if stage in (None, "test", "predict"):
+            if self.data_test is None:
+                self.data_test = PotholeImageDataset(self.location / "test")
+
+    # Sets up the dataloader for train, val, test, and predict
     def train_dataloader(self):
-        return torch.utils.data.DataLoader(self.data_train,
-                                           batch_size=self.batch_size,
-                                           num_workers=self.num_workers,
-                                           shuffle=True)
+        return DataLoader(
+            self.data_train,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=True)
 
     def val_dataloader(self):
-        return torch.utils.data.DataLoader(self.data_val,
-                                           batch_size=self.batch_size,
-                                           num_workers=self.num_workers,
-                                           shuffle=False)
+        return DataLoader(
+            self.data_val,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False)
 
     def test_dataloader(self):
-        return torch.utils.data.DataLoader(self.data_test,
-                                           batch_size=self.batch_size,
-                                           num_workers=self.num_workers,
-                                           shuffle=False)
+        return DataLoader(
+            self.data_test,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False)
 
     def predict_dataloader(self):
-        return torch.utils.data.DataLoader(self.data_test,
-                                           batch_size=self.batch_size,
-                                           num_workers=self.num_workers,
-                                           shuffle=False)
+        return DataLoader(
+            self.data_test,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            shuffle=False)
 
-data_module = CIFAR10DataModule()
+
+data_module = PotholeDataModule()
 data_module.setup('validate')
 data_module.input_shape
 
