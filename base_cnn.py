@@ -26,59 +26,49 @@ if torch.cuda.is_available():
     print("GPU Count:",torch.cuda.device_count())
     print("GPU Properties:",torch.cuda.get_device_properties())
 
-# Function that provides labeling when labels are needed in reward function
-def labeling(paths):
-    label_map = {"none": 0, "low": 1, "medium": 2, "high": 3}
-    labels = []
-    for p in paths:
-        name = Path(p).parent.name.lower()
-        if name not in label_map:
-            raise ValueError(f"Unexpected label folder '{name}' for {p}")
-        labels.append(label_map[name])
-    return torch.tensor(labels)
-
 
 #Loading Dataset Class
 class PotholeImageDataset(Dataset):
-    def __init__(self, folder):
-        self.folder = Path(folder)
-        #Check to see if the folder is there before proceeding
-        if not self.folder.is_dir():
-            raise FileNotFoundError(f"Dataset folder not found: {self.folder.resolve()}")
-
-        extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-        self.images = sorted(path for path in self.folder.rglob("*")
-            if path.is_file() and path.suffix.lower() in extensions)
-        
-        if not self.images:
-            raise ValueError(f"No images found in {self.folder}")
-        
-        self.labels = labeling(self.images)
-
-        #Formats the images to make it readable to the system
-        self.transform = transforms.Compose([transforms.Resize((64, 64)), transforms.ToTensor()])
+    def __init__(self, folder, transform=None):
+        self.folder = folder
+        self.transform = transform
 
     def __len__(self):
-        return len(self.images)
+        return len(self.folder)
 
     def __getitem__(self, index):
-        image_path = self.images[index]
+        image_path, label = self.folder[index]
 
         with Image.open(image_path) as image:
             image = image.convert("RGB")
-            image = self.transform(image)
-        return (image, self.labels[index])
+
+            if self.transform:
+                image = self.transform(image)
+        return image, label
+
+# Define image transformations
+train_transform = transforms.Compose([
+    transforms.Resize((64, 64)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ToTensor()
+])
+
+eval_transform = transforms.Compose([
+    transforms.Resize((64, 64)),
+    transforms.ToTensor()
+])
 
 #Prepares the Datasets and DataLoaders for the model
 class PotholeDataModule(pl.LightningDataModule):
 
-    def __init__(self, batch_size=16, num_workers=0, location="./datasets"):
+    def __init__(self, batch_size=16, num_workers=0, location="./datasets/label_more_sample", split_dir="./datasets/splits"):
         super().__init__()
 
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.location = Path(location)
+        self.split_dir = Path(split_dir)
 
         self.input_shape = (3, 64, 64)
         self.output_shape = (4,)
@@ -87,23 +77,61 @@ class PotholeDataModule(pl.LightningDataModule):
         self.data_val = None
         self.data_test = None
 
+        self.splits_created = False
+
     def setup(self, stage=None):
-        #Sets up the testing data
-        if stage in (None, "fit", "validate"):
-            if self.data_train is None:
-                self.data_train = PotholeImageDataset(self.location / "train")
+        if self.splits_created:
+            return
 
-            if self.data_val is None:
-                val_folder = self.location / "val"
+        # Map severity labels to numbers
+        label_map = {"none": 0, "low": 1, "medium": 2, "high": 3}
 
-                if not val_folder.is_dir():
-                    val_folder = self.location / "valid"
+        extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-                self.data_val = PotholeImageDataset(val_folder)
-            #Load it when done or predicting
-        if stage in (None, "test", "predict"):
-            if self.data_test is None:
-                self.data_test = PotholeImageDataset(self.location / "test")
+        # Find all image files
+        image_paths = [
+            p for p in self.location.rglob("*")
+            if p.is_file() and p.suffix.lower() in extensions
+        ]
+
+        image_lookup = {p.name: p for p in image_paths}
+
+        datasets = {}
+
+        # Take from the split csvs
+        for split_name, transform in [("train", train_transform),
+                                      ("val", eval_transform),
+                                      ("test", eval_transform)]:
+
+            df = pd.read_csv(self.split_dir / f"{split_name}.csv")
+            
+            # Match CSV filenames to images
+            records = []
+
+            for i, row in df.iterrows():
+                filename = row["filename"]
+                label = str(row["label"]).strip().lower()
+
+                if label not in label_map:
+                    raise ValueError(f"Unknown label: {label}")
+
+                if filename not in image_lookup:
+                    raise FileNotFoundError(
+                        f"Could not find image: {filename}"
+                    )
+
+                records.append((
+                    image_lookup[filename],
+                    label_map[label]
+                ))
+
+            datasets[split_name] = PotholeImageDataset(records, transform)
+
+        self.data_train = datasets["train"]
+        self.data_val = datasets["val"]
+        self.data_test = datasets["test"]
+
+        self.splits_created = True
 
     # Sets up the dataloader for train, val, test, and predict
     def train_dataloader(self):
@@ -143,12 +171,16 @@ input_shape = (1,)+data_module.input_shape
 output_shape = (1,)+data_module.output_shape
 input_ones = torch.ones(size=input_shape)
 
-# Define model - SIZING OF THE CONV AND POOLING WILL CHANGE BASED ON DATASET
+# Define model
 class NeuralNetwork(pl.LightningModule):
-    def __init__(self,
+    def __init__(self, input_shape, output_shape,
                  **kwargs):
         super().__init__(**kwargs)
-        self.conv1 = torch.nn.Conv2d(1, # Input channels
+
+        self.input_shape = input_shape
+        self.output_shape = output_shape
+
+        self.conv1 = torch.nn.Conv2d(3, # Input channels
                                      3, # Output channels
                                      kernel_size=(2,2), # Kernel window
                                      stride=(1,1), # Step size
@@ -162,8 +194,8 @@ class NeuralNetwork(pl.LightningModule):
         
         self.pool1_2 = torch.nn.MaxPool2d((2,2))
         self.flatten = torch.nn.Flatten()
-        self.output_layer = torch.nn.Linear(20,10)
-        self.output_activation = torch.nn.Softmax()
+        self.output_layer = torch.nn.Linear(5*31*31,4)
+        self.output_activation = torch.nn.Softmax(dim=1)
         
     def forward(self, x):
         y = x
@@ -227,7 +259,7 @@ class LightningNetwork(NeuralNetwork):
         self.log('val_loss', loss, on_step=False, on_epoch=True)
         return loss
         
-    def testing_step(self, test_batch, batch_idx):
+    def test_step(self, test_batch, batch_idx):
         x, y_true = test_batch
         y_pred = self(x)
         for metric_name, metric_function in self.network_metrics.items():
@@ -253,7 +285,7 @@ class MultiClassNetwork(LightningNetwork):
         self.network_loss = torch.nn.CrossEntropyLoss()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=0.01)
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
         return optimizer
 
 model = MultiClassNetwork(input_shape=data_module.input_shape,
@@ -267,18 +299,20 @@ logger = pl.loggers.CSVLogger("logs",
                               name="Base-CNN",
                               version=my_job_id)
 
-trainer = pl.Trainer(logger=logger,
+wandb_logger = pl.loggers.WandbLogger(project="Base-CNN",name= my_job_id)
+
+trainer = pl.Trainer(logger=[logger,wandb_logger],
                      max_epochs=50,
                      enable_progress_bar=True,
                      enable_checkpointing=False,
                      log_every_n_steps=0,
                      callbacks=[pl.callbacks.RichProgressBar(refresh_rate=20)])
 
-trainer.validate(model, data_module)
-
 trainer.fit(model, data_module)
 
 trainer.validate(model, data_module)
+
+trainer.test(model, data_module)
 
 results = pd.read_csv(logger.log_dir+"/metrics.csv")
 results
@@ -287,3 +321,8 @@ print("Validation accuracy:",*["%.8f"%(x) for x in
                                results['val_acc'][np.logical_not(np.isnan(results["val_acc"]))]])
 print("Validation loss:",*["%.8f"%(x) for x in
                                results['val_loss'][np.logical_not(np.isnan(results["val_loss"]))]])
+print("Training accuracy:", *["%.8f"%(x) for x in
+    results['train_acc'][np.logical_not(np.isnan(results["train_acc"]))]])
+
+print("Training loss:", *["%.8f"%(x) for x in
+    results['train_loss'][np.logical_not(np.isnan(results["train_loss"]))]])
