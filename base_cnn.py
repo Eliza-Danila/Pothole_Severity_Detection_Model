@@ -16,6 +16,7 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from torchvision.models import resnet50, ResNet50_Weights
 
 my_job_id = os.environ["SLURM_JOBID"]
 
@@ -46,23 +47,30 @@ class PotholeImageDataset(Dataset):
                 image = self.transform(image)
         return image, label
 
-# Define image transformations
+IMG_SIZE = 224  # ResNet's native size
+
+imagenet_norm = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+
 train_transform = transforms.Compose([
-    transforms.Resize((64, 64)),
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.7, 1.0), ratio=(0.9, 1.1)),
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(10),
-    transforms.ToTensor()
+    transforms.ColorJitter(0.3, 0.3, 0.3),
+    transforms.ToTensor(),
+    imagenet_norm,
 ])
 
 eval_transform = transforms.Compose([
-    transforms.Resize((64, 64)),
-    transforms.ToTensor()
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    imagenet_norm,
 ])
 
 #Prepares the Datasets and DataLoaders for the model
 class PotholeDataModule(pl.LightningDataModule):
 
-    def __init__(self, batch_size=16, num_workers=0, location="./datasets/label_more_sample", split_dir="./datasets/splits"):
+    def __init__(self, batch_size=32, num_workers=4, location="./datasets/label_more_sample", split_dir="./datasets/splits"):
         super().__init__()
 
         self.batch_size = batch_size
@@ -70,7 +78,7 @@ class PotholeDataModule(pl.LightningDataModule):
         self.location = Path(location)
         self.split_dir = Path(split_dir)
 
-        self.input_shape = (3, 64, 64)
+        self.input_shape = (3, IMG_SIZE, IMG_SIZE)
         self.output_shape = (4,)
 
         self.data_train = None
@@ -173,47 +181,40 @@ input_ones = torch.ones(size=input_shape)
 
 # Define model
 class NeuralNetwork(pl.LightningModule):
-    def __init__(self, input_shape, output_shape,
-                 **kwargs):
+    def __init__(self, input_shape, output_shape, freeze_backbone=True, **kwargs):
         super().__init__(**kwargs)
 
         self.input_shape = input_shape
         self.output_shape = output_shape
+        self.freeze_backbone = freeze_backbone
 
-        self.conv1 = torch.nn.Conv2d(3, # Input channels
-                                     3, # Output channels
-                                     kernel_size=(2,2), # Kernel window
-                                     stride=(1,1), # Step size
-                                     padding=(0,0))
-        self.conv2 = torch.nn.Conv2d(3, # Input channels
-                                     5, # Output channels
-                                     kernel_size=(2,2), # Kernel window
-                                     stride=(1,1), # Step size
-                                     padding=(0,0))
-        self.conv_activation = torch.nn.ReLU()
-        
-        self.pool1_2 = torch.nn.MaxPool2d((2,2))
-        self.flatten = torch.nn.Flatten()
-        self.output_layer = torch.nn.Linear(5*31*31,4)
+        self.backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+
+        self.backbone.fc = torch.nn.Sequential(
+            torch.nn.Dropout(0.5),
+            torch.nn.Linear(self.backbone.fc.in_features, output_shape[-1]))
+
         self.output_activation = torch.nn.Softmax(dim=1)
-        
+
+        if freeze_backbone:
+            for name, p in self.backbone.named_parameters():
+                if not name.startswith("fc."):
+                    p.requires_grad = False
+
+    def train(self, mode=True):
+        # keep frozen BatchNorm layers using their pretrained statistics
+        super().train(mode)
+        if self.freeze_backbone:
+            for name, module in self.backbone.named_children():
+                if name != "fc":
+                    module.eval()
+        return self
+
     def forward(self, x):
-        y = x
-        y = self.conv1(y)
-        y = self.conv_activation(y)
-        y = self.conv2(y)
-        y = self.conv_activation(y)
-        y = self.pool1_2(y)
-        y = self.flatten(y)
-        # y = y.flatten(start_dim=1)
-        y = self.output_layer(y)
-        return y
+        return self.backbone(x)
 
     def predict(self, x):
-        y = x
-        y = self(y)
-        y = self.output_activation(y)
-        return y
+        return self.output_activation(self(x))
 
 model = NeuralNetwork(input_shape=data_module.input_shape,
                       output_shape=data_module.output_shape)
@@ -282,14 +283,15 @@ class MultiClassNetwork(LightningNetwork):
                                                         num_classes=self.output_shape[-1])
         })
         # This creates a loss function
-        self.network_loss = torch.nn.CrossEntropyLoss()
+        self.network_loss = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
-        return optimizer
+        params = [p for p in self.parameters() if p.requires_grad]
+        return torch.optim.AdamW(params, lr=1e-5, weight_decay=1e-2)
 
 model = MultiClassNetwork(input_shape=data_module.input_shape,
-                          output_shape=data_module.output_shape)
+                          output_shape=data_module.output_shape,
+                          freeze_backbone=True)
 
 # summary of model
 summary(model, input_size=input_shape)
@@ -302,7 +304,7 @@ logger = pl.loggers.CSVLogger("logs",
 wandb_logger = pl.loggers.WandbLogger(project="Base-CNN",name= my_job_id)
 
 trainer = pl.Trainer(logger=[logger,wandb_logger],
-                     max_epochs=50,
+                     max_epochs=300,
                      enable_progress_bar=True,
                      enable_checkpointing=False,
                      log_every_n_steps=0,
